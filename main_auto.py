@@ -2,6 +2,8 @@
 
 Reference:
 [Yoo et al. 2019] Learning Loss for Active Learning (https://arxiv.org/abs/1905.03677)
+
+visualize status with tensorboard
 '''
 
 # Python
@@ -21,6 +23,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data.sampler import SubsetRandomSampler  # 随机采样子集
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 
 # Torchvison
 import torchvision.transforms as T
@@ -28,7 +32,6 @@ import torchvision.models as models
 from torchvision.datasets import CIFAR100, CIFAR10
 
 # Utils
-import visdom
 from tqdm import tqdm
 
 # Custom
@@ -46,11 +49,13 @@ exp = f'{tag}_{get_curtime()}'
 exp_dir = f'exp/{exp}'
 os.makedirs(exp_dir, exist_ok=True)
 dump_json(cfg2dict(config), out_path=f'{exp_dir}/config.json')
-# logs
+# tensorboard / logs
+writer = SummaryWriter(log_dir=os.path.join('runs', exp))
 sys.stdout = Logger(f'{exp_dir}/run.log', sys.stdout)
 # output model
 ckpt_dir = os.path.join('output', exp)
 os.makedirs(ckpt_dir, exist_ok=True)
+print('exp:', exp)
 
 # Data
 train_transform = T.Compose([
@@ -106,28 +111,33 @@ def LossPredLoss(input, target, margin=1.0, reduction='mean'):
     return loss
 
 
-##
-# Train Utils
-iters = 0
+def compute_acc(scores, labels):
+    _, preds = torch.max(scores.data, 1)
+    acc = (preds == labels).sum().item() / labels.size(0)
+
+    return acc * 100
 
 
-#
+def record_lr(optimizers, epoch):
+    lr_backbone = get_lr(optimizers['backbone'])
+    lr_module = get_lr(optimizers['module'])
+    writer.add_scalars(f'{prefix}/lr', {
+        'backbone': lr_backbone,
+        'module': lr_module
+    }, global_step=epoch)
+
+
 def train_epoch(models, criterion, optimizers, dataloaders,
-                epoch, epoch_loss, vis=None, plot_data=None):
+                epoch, epoch_loss):
     """
-    Args:
-        models:
-        criterion:
-        optimizers:
-        dataloaders:
         epoch:      current epoch in train()
         epoch_loss: loss total epoch: EPOCHL = 120
-        vis:
-        plot_data:
     """
     models['backbone'].train()
     models['module'].train()
-    global iters
+
+    train_backbone_loss, train_module_loss = AverageMeter(), AverageMeter()
+    train_loss, train_acc = AverageMeter(), AverageMeter()
 
     t = tqdm(dataloaders['train'], leave=False, total=len(dataloaders['train']))  # leave=False 刷新
     t.set_description(f"Epoch: {epoch}")
@@ -135,7 +145,6 @@ def train_epoch(models, criterion, optimizers, dataloaders,
     for data in t:
         inputs = data[0].cuda()
         labels = data[1].cuda()
-        iters += 1
 
         optimizers['backbone'].zero_grad()
         optimizers['module'].zero_grad()
@@ -167,28 +176,17 @@ def train_epoch(models, criterion, optimizers, dataloaders,
         optimizers['backbone'].step()
         optimizers['module'].step()
 
-        # Visualize
-        if iters % 100 == 0 and vis and plot_data:
-            plot_data['X'].append(iters)  # list for X
-            plot_data['Y'].append([  # list for different Y
-                m_backbone_loss.item(),
-                m_module_loss.item(),
-                loss.item()
-            ])
+        train_backbone_loss.update(m_backbone_loss)
+        train_module_loss.update(m_module_loss)
+        train_loss.update(loss)
+        train_acc.update(compute_acc(scores, labels))
 
-            vis.line(
-                X=np.stack([np.array(plot_data['X'])] * len(plot_data['legend']), 1),  # [N,3] 沿列 stack
-                Y=np.array(plot_data['Y']),  # [N,3]
-                opts={
-                    'title': 'Loss over Time',
-                    'legend': plot_data['legend'],
-                    'xlabel': 'Iterations',
-                    'ylabel': 'Loss',
-                    'width': 1200,
-                    'height': 390,
-                },
-                win=1
-            )
+    return {
+        'backbone_loss': train_backbone_loss.avg,
+        'module_loss': train_module_loss.avg,
+        'total_loss': train_loss.avg,
+        'acc': train_acc.avg
+    }
 
 
 @torch.no_grad()
@@ -197,29 +195,29 @@ def test(models, dataloaders, mode='val'):
     models['backbone'].eval()
     models['module'].eval()
 
-    total = 0
-    correct = 0
+    test_loss, test_acc = AverageMeter(), AverageMeter()
 
     for (inputs, labels) in dataloaders[mode]:
         inputs = inputs.cuda()
         labels = labels.cuda()
 
         scores, _ = models['backbone'](inputs)
-        _, preds = torch.max(scores.data, 1)
-        total += labels.size(0)
-        correct += (preds == labels).sum().item()
 
-    return 100 * correct / total
+        loss = F.cross_entropy(scores, labels, reduction='mean')
+        test_loss.update(loss)
+        test_acc.update(compute_acc(scores, labels))
+
+    return test_loss.avg, test_acc.avg
 
 
 def train(models, criterion, optimizers, schedulers,
-          dataloaders, num_epochs, epoch_loss,
-          vis, plot_data):
+          dataloaders, num_epochs, epoch_loss):
     print('>> Train a Model.')
     best_acc = 0.
 
     for epoch in range(1, num_epochs + 1):
-        train_epoch(models, criterion, optimizers, dataloaders, epoch, epoch_loss, vis, plot_data)
+        record_lr(optimizers, epoch)
+        train_status = train_epoch(models, criterion, optimizers, dataloaders, epoch, epoch_loss)
 
         # update optimizer lr
         # after optimizer.step(), in case skipping the 1st val of lr_schedule
@@ -228,7 +226,7 @@ def train(models, criterion, optimizers, schedulers,
 
         # Save a checkpoint
         if epoch % 5 == 0:  # 每 5 个 epoch，check 一下
-            acc = test(models, dataloaders, 'test')
+            test_loss, acc = test(models, dataloaders, 'test')
             if best_acc < acc:
                 best_acc = acc
                 torch.save({
@@ -237,10 +235,21 @@ def train(models, criterion, optimizers, schedulers,
                     'state_dict_module': models['module'].state_dict()
                 }, f'{ckpt_dir}/{tag}.pth')
             print('Epoch: {}, Val Acc: {:.3f} \t Best Acc: {:.3f}'.format(epoch, acc, best_acc))
+
+            writer.add_scalars(f'{prefix}/train_loss', {
+                'backbone': train_status['backbone_loss'],
+                'module': train_status['module_loss'],
+                'total': train_status['total_loss'],
+            }, global_step=epoch)
+            writer.add_scalar(f'{prefix}/test_loss', test_loss, global_step=epoch)
+            writer.add_scalars(f'{prefix}/accuracy', {
+                'train': train_status['acc'],
+                'test': acc
+            }, global_step=epoch)
+
     print('>> Finished.')
 
 
-#
 @torch.no_grad()
 def get_uncertainty(models, unlabeled_loader):
     models['backbone'].eval()
@@ -265,23 +274,18 @@ def get_uncertainty(models, unlabeled_loader):
 
 if __name__ == '__main__':
 
-    vis = visdom.Visdom(server='http://localhost', port=9000, use_incoming_socket=False)
-    plot_data = {
-        'X': [],
-        'Y': [],
-        'legend': ['Backbone Loss', 'Module Loss', 'Total Loss']
-    }
-
     torch.backends.cudnn.benchmark = True
 
-    for trial in range(TRIALS):  # 减少实验随机性
-        # Initialize a labeled dataset by randomly sampling K=ADDENDUM=1,000 data points from the entire dataset.
+    seeds = [10, 20, 30]
 
+    for trial in range(TRIALS):  # 减少实验随机性
         # 随机采样 L0/U0
+        random.seed(seeds[trial])
         indices = list(range(NUM_TRAIN))
         random.shuffle(indices)
-        labeled_set = indices[:ADDENDUM]  # L0
+        labeled_set = indices[:ADDENDUM]  # L0, K=ADDENDUM=1,000
         unlabeled_set = indices[ADDENDUM:]  # U0
+        random.seed()
 
         train_loader = DataLoader(cifar10_train, batch_size=BATCH,  # 从 cifar10_train 选出 labeset
                                   sampler=SubsetRandomSampler(labeled_set),  # 再次随机 labeled_set 顺序
@@ -299,6 +303,8 @@ if __name__ == '__main__':
 
         # Active learning cycles
         for cycle in range(CYCLES):  # 10
+            prefix = f'trial{trial + 1}/cycle{cycle + 1}'
+
             # criterion, optimizer and scheduler (re)initialization 重新初始化
             criterion = nn.CrossEntropyLoss(reduction='none')
             optim_backbone = optim.SGD(models['backbone'].parameters(), lr=LR,
@@ -311,11 +317,19 @@ if __name__ == '__main__':
             optimizers = {'backbone': optim_backbone, 'module': optim_module}
             schedulers = {'backbone': sched_backbone, 'module': sched_module}
 
+            writer.add_scalars(f'trial{trial + 1}/dataset', {
+                'label': len(labeled_set),
+                'unlabel': len(unlabeled_set)
+            }, global_step=cycle)
+
             # train 200 epochs and test
-            train(models, criterion, optimizers, schedulers, dataloaders, EPOCH, EPOCHL, vis, plot_data)
-            acc = test(models, dataloaders, mode='test')
-            print('Trial {}/{} || Cycle {}/{} || Label set size {}: Test acc {}'.format(trial + 1, TRIALS, cycle + 1,
-                                                                                        CYCLES, len(labeled_set), acc))
+            train(models, criterion, optimizers, schedulers, dataloaders, EPOCH, EPOCHL)
+            _, acc = test(models, dataloaders, mode='test')
+
+            writer.add_scalar(f'trial{trial + 1}/cycle_acc', acc, global_step=cycle)
+
+            print('Trial {}/{} || Cycle {}/{} || Label set size {}: Test acc {}'.format(
+                trial + 1, TRIALS, cycle + 1, CYCLES, len(labeled_set), acc))
 
             ##
             #  Update the labeled dataset via loss prediction-based uncertainty measurement
@@ -351,5 +365,4 @@ if __name__ == '__main__':
             'trial': trial + 1,
             'state_dict_backbone': models['backbone'].state_dict(),
             'state_dict_module': models['module'].state_dict()
-        },
-            './cifar10/train/weights/active_resnet18_cifar10_trial{}.pth'.format(trial))
+        }, f'{ckpt_dir}/{tag}_trial{trial + 1}.pth')

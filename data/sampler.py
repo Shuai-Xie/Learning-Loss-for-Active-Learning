@@ -1,6 +1,7 @@
-import torch
+from torch.utils.data import Sampler
 
-class SubsetSequentialSampler(torch.utils.data.Sampler):
+
+class SubsetSequentialSampler(Sampler):
     r"""Samples elements sequentially from a given list of indices, without replacement.
 
     Arguments:
@@ -12,6 +13,6 @@ class SubsetSequentialSampler(torch.utils.data.Sampler):
 
     def __iter__(self):
         return (self.indices[i] for i in range(len(self.indices)))
-    
+
     def __len__(self):
         return len(self.indices)
