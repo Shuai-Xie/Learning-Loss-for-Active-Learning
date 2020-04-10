@@ -9,4 +9,4 @@
 .idea/*.iml
 .idea/*/*.xml
 
-__pycache__/
+**/__pycache__/
